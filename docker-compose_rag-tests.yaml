@@ -1,0 +1,133 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.17
+    restart: always
+    container_name: qdrant
+    ports:
+      - 6333:6333
+      - 6334:6334
+      - 6335:6335
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - ./tests/tmp/qdrant/storage:/qdrant/storage
+    networks:
+      - rag-tests
+  
+  chromadb:
+    image: chromadb/chroma:1.5.5
+    restart: always
+    container_name: chromadb
+    environment:
+      - ANONYMIZED_TELEMETRY=False
+      - ALLOW_RESET=True
+      - IS_PERSISTENT=True
+      - CHROMA_API_IMPL=chromadb.api.segment.SegmentAPI
+    volumes:
+      - chroma_data:/data
+    ports:
+      - 8000:8000
+    networks:
+      - rag-tests
+
+  chromadb-ui:
+    image: timbuchinger/chromadb-ui:latest
+    container_name: chromadb-ui
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_CHROMADB_HOST=http://chromadb:8000
+    entrypoint: /bin/sh -c
+    command: >
+      "printf 'server {
+          listen 80;
+          server_name _;
+          root /usr/share/nginx/html;
+          index index.html;
+
+          location /api/ {
+              proxy_pass http://chromadb:8000/api/;
+              proxy_set_header Host $$host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $$scheme;
+          }
+
+          location / {
+              try_files $$uri $$uri/ /index.html;
+          }
+
+          location = /index.html {
+              add_header Cache-Control \"no-cache\";
+          }
+      }' > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"
+    depends_on:
+      - chromadb
+    networks:
+      - rag-tests
+
+  chromadb-init:
+    image: curlimages/curl:latest
+    container_name: chromadb-init
+    environment:
+      CHROMA_SERVER_URL: http://chromadb:8000
+      DATABASE_NAME: test_db
+      TENANT_NAME: test_tenant
+    entrypoint: >
+      sh -c "
+      set -e;
+
+      echo 'Waiting for Chroma...';
+      until curl -s --fail $$CHROMA_SERVER_URL/api/v2/heartbeat > /dev/null; do
+        echo \"Waiting for API readiness...\"
+        sleep 2;
+      done;
+
+      echo 'Ensuring tenant exists...';
+      status=\$(curl -s -o /dev/null -w '%{http_code}' \\
+        -X POST $$CHROMA_SERVER_URL/api/v2/tenants \\
+        -H 'Content-Type: application/json' \\
+        -d '{\"name\":\"'$$TENANT_NAME'\"}');
+
+      echo \"Tenant status: $$status\";
+
+      if [ \"$$status\" = \"409\" ]; then
+        echo 'Tenant already exists';
+      elif [ \"$$status\" != \"200\" ] && [ \"$$status\" != \"201\" ]; then
+        echo \"Tenant creation failed with status $$status\";
+        exit 1;
+      else
+        echo \"Tenant $$TENANT_NAME created\";
+      fi;
+
+      echo 'Ensuring database exists...';
+      status=\$(curl -s -o /dev/null -w '%{http_code}' \\
+        -X POST $$CHROMA_SERVER_URL/api/v2/tenants/$$TENANT_NAME/databases \\
+        -H 'Content-Type: application/json' \\
+        -d '{\"name\":\"'$$DATABASE_NAME'\"}');
+
+      echo \"Database status: $$status\";
+
+      if [ \"$$status\" = \"409\" ]; then
+        echo 'Database already exists';
+      elif [ \"$$status\" != \"200\" ] && [ \"$$status\" != \"201\" ]; then
+        echo \"Database creation failed with status $$status\";
+        exit 1;
+      else
+        echo \"Database $$DATABASE_NAME created\";
+      fi;
+
+      echo 'Chromadb initialization completed successfully.';
+      "
+    depends_on:
+      - chromadb
+    networks:
+      - rag-tests
+
+volumes:
+  chroma_data:
+    driver: local
+
+networks:
+  rag-tests:
+    driver: bridge

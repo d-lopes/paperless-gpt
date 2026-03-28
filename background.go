@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"paperless-gpt/rag"
 	"slices"
 	"strings"
 	"time"
@@ -13,7 +14,11 @@ import (
 type BackgroundProcessor interface {
 	processAutoOcrTagDocuments(ctx context.Context) (int, error)
 	processAutoTagDocuments(ctx context.Context) (int, error)
+	processAutoRagDocuments(ctx context.Context) (int, error)
+	processRagReconciliation(ctx context.Context) (int, error)
 	isOcrEnabled() bool
+	isRagEnabled() bool
+	getReconciliationInterval() time.Duration
 }
 
 // Start our background tasks in a goroutine
@@ -24,6 +29,7 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 		pollingInterval := 10 * time.Second
 
 		backoffDuration := minBackoffDuration
+		lastReconciliation := time.Time{} // zero value ensures first run triggers immediately
 
 		for {
 			select {
@@ -52,6 +58,27 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 				}
 				count += autoCount
 
+				// Run RAG sync
+				if app.isRagEnabled() {
+					ragCount, err := app.processAutoRagDocuments(ctx)
+					if err != nil {
+						return 0, fmt.Errorf("error in processAutoRagDocuments: %w", err)
+					}
+					count += ragCount
+
+					// Run reconciliation based on configured interval
+					if time.Since(lastReconciliation) >= app.getReconciliationInterval() {
+						reconCount, err := app.processRagReconciliation(ctx)
+						if err != nil {
+							log.Errorf("error in processRagReconciliation: %v", err)
+							// Do not fail the whole iteration if reconciliation fails
+						} else {
+							count += reconCount
+						}
+						lastReconciliation = time.Now()
+					}
+				}
+
 				return count, nil
 			}()
 
@@ -76,6 +103,13 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 			}
 		}
 	}()
+}
+
+func (app *App) getReconciliationInterval() time.Duration {
+	if app.ragReconciliationInterval > 0 {
+		return app.ragReconciliationInterval
+	}
+	return 60 * time.Minute // default 1 hour
 }
 
 // processAutoTagDocuments handles the background auto-tagging of documents
@@ -285,4 +319,147 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 	}
 
 	return successCount, nil
+}
+
+// processAutoRagDocuments handles pushing documents to a connected RAG provider
+func (app *App) processAutoRagDocuments(ctx context.Context) (int, error) {
+	documents, err := app.Client.GetDocumentsByTag(ctx, autoRagTag, 25)
+	if err != nil {
+		return 0, fmt.Errorf("error fetching documents with autoRagTag: %w", err)
+	}
+
+	if len(documents) == 0 {
+		log.Debugf("No documents with tag %s found for RAG sync", autoRagTag)
+		return 0, nil
+	}
+
+	log.Debugf("Found %d documents with tag %s for RAG sync", len(documents), autoRagTag)
+
+	successCount := 0
+	var errs []error
+
+	for _, docSummary := range documents {
+		document, err := app.Client.GetDocument(ctx, docSummary.ID)
+		if err != nil {
+			err = fmt.Errorf("error fetching full details for document %d: %w", docSummary.ID, err)
+			documentLogger(docSummary.ID).Error(err.Error())
+			errs = append(errs, err)
+			continue
+		}
+
+		docLogger := documentLogger(document.ID)
+		docLogger.Info("Processing document for RAG Export")
+
+		var filteredTags []string
+		for _, t := range document.Tags {
+			if t != autoRagTag {
+				filteredTags = append(filteredTags, t)
+			}
+		}
+
+		ragDoc := rag.Document{
+			ID:            document.ID,
+			Title:         document.Title,
+			Content:       document.Content,
+			Tags:          filteredTags,
+			DocumentType:  document.DocumentTypeName,
+			Correspondent: document.Correspondent,
+			CreatedDate:   document.CreatedDate,
+		}
+
+		err = app.ragProvider.PushDocument(ctx, ragDoc)
+		if err != nil {
+			docLogger.Errorf("Failed to push document to RAG provider: %v", err)
+			errs = append(errs, fmt.Errorf("document %d RAG error: %w", document.ID, err))
+			continue
+		}
+
+		addTags := []string{}
+		if ragCompleteTag != "" {
+			addTags = []string{ragCompleteTag}
+			docLogger.Infof("Adding tags %v to document %d", addTags, document.ID)
+		} else {
+			docLogger.Infof("No RAG_COMPLETE_TAG configured, not adding marked for RAG processing as tag to document %d", document.ID)
+		}
+
+		// Update tags on success
+		documentSuggestion := DocumentSuggestion{
+			ID:               document.ID,
+			OriginalDocument: document,
+			RemoveTags:       []string{autoRagTag},
+			SuggestedTags:    addTags, // using suggested tags here be caue AddTags is not implemented
+			KeepOriginalTags: true,
+		}
+
+		err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{documentSuggestion}, app.Database, false)
+		if err != nil {
+			docLogger.Errorf("Failed to remove tag %s from document %d: %v", autoRagTag, document.ID, err)
+			errs = append(errs, fmt.Errorf("document %d update error: %w", document.ID, err))
+			continue
+		}
+
+		docLogger.Info("Successfully pushed document to RAG Server")
+		successCount++
+	}
+
+	if len(errs) > 0 {
+		return successCount, fmt.Errorf("one or more errors occurred: %w", errors.Join(errs...))
+	}
+
+	return successCount, nil
+}
+
+func (app *App) processRagReconciliation(ctx context.Context) (int, error) {
+	if app.ragProvider == nil {
+		return 0, nil
+	}
+
+	log.Infof("Starting RAG reconciliation")
+
+	// 1. Get all doc IDs from RAG
+	ragDocIDs, err := app.ragProvider.GetAllDocumentIDs(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("error fetching RAG document IDs: %w", err)
+	}
+
+	if len(ragDocIDs) == 0 {
+		log.Infof("RAG reconciliation completed: No documents found in RAG")
+		return 0, nil
+	}
+
+	// 2. Get all doc IDs from paperless-ngx which have been processed by RAG
+	paperlessDocIDs, err := app.Client.GetDocumentsByTag(ctx, ragCompleteTag, app.ragPageSize)
+	if err != nil {
+		return 0, fmt.Errorf("error fetching active paperless document IDs: %w", err)
+	} else {
+		log.Infof("RAG reconciliation: %d documents in paperless-ngx, %d in vector store", len(paperlessDocIDs), len(ragDocIDs))
+	}
+
+	// 3. Create map for quick lookup
+	activeDocsMap := make(map[int]struct{}, len(paperlessDocIDs))
+	for _, doc := range paperlessDocIDs {
+		activeDocsMap[doc.ID] = struct{}{}
+	}
+
+	// 4. Compare and delete orphaned chunks
+	deletedCount := 0
+	for _, ragDocID := range ragDocIDs {
+		if _, exists := activeDocsMap[ragDocID]; !exists {
+			log.Infof("Deleting orphaned RAG chunks for document ID: %d", ragDocID)
+			err := app.ragProvider.DeleteDocument(ctx, ragDocID)
+			if err != nil {
+				log.Errorf("Failed to delete orphaned chunks for document ID %d: %v", ragDocID, err)
+			} else {
+				deletedCount++
+			}
+		}
+	}
+
+	if deletedCount > 0 {
+		log.Infof("RAG reconciliation completed: deleted chunks for %d orphaned document(s)", deletedCount)
+	} else {
+		log.Infof("RAG reconciliation completed: no orphaned documents found")
+	}
+
+	return deletedCount, nil
 }

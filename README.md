@@ -60,7 +60,10 @@ https://github.com/user-attachments/assets/bd5d38b9-9309-40b9-93ca-918dfa4f3fd4
    - **Tagging**: Decide how documents get tagged—manually, automatically, or via OCR-based flows.
    - **PDF Processing**: Configure how OCR-enhanced PDFs are handled, with options to save locally or upload to paperless-ngx.
 
-8. **Simple Docker Deployment**  
+8. **RAG Integration (Experimental)**  
+   Export documents to a vector database (Qdrant or ChromaDB) for Retrieval-Augmented Generation. Automatically sync tagged documents and periodically reconcile deletions to keep your vector store in sync with paperless-ngx.
+
+9. **Simple Docker Deployment**  
    A few environment variables, and you're off! Compose it alongside paperless-ngx with minimal fuss.
 
 9. **Unified Web UI**
@@ -101,6 +104,10 @@ https://github.com/user-attachments/assets/bd5d38b9-9309-40b9-93ca-918dfa4f3fd4
     - [Metadata Copying Limitations](#metadata-copying-limitations)
     - [Safety Features](#safety-features)
     - [Usage Recommendations](#usage-recommendations)
+  - [RAG Integration (Experimental)](#rag-integration-experimental)
+    - [Supported Providers](#supported-providers)
+    - [RAG Configuration](#rag-configuration)
+    - [RAG Reconciliation](#rag-reconciliation)
   - [Configuration](#configuration)
     - [Environment Variables](#environment-variables)
     - [Custom Prompt Templates](#custom-prompt-templates)
@@ -238,6 +245,18 @@ services:
       AUTO_OCR_TAG: "paperless-gpt-ocr-auto" # Optional, default: paperless-gpt-ocr-auto
       OCR_LIMIT_PAGES: "5" # Optional, default: 5. Set to 0 for no limit.
       LOG_LEVEL: "info" # Optional: debug, warn, error
+
+      # RAG Integration (Optional)
+      # RAG_PROVIDER: "qdrant"  # or "chromadb"
+      # RAG_PROVIDER_URL: "http://qdrant:6334"
+      # RAG_API_KEY: "your_rag_api_key" # Optional, depends on provider
+      # RAG_COLLECTION: "paperless-documents"
+      # RAG_EMBEDDING_PROVIDER: "openai" # or "ollama"
+      # RAG_EMBEDDING_MODEL: "text-embedding-3-small"
+      # AUTO_RAG_TAG: "paperless-gpt-auto" # Optional, defaults to AUTO_TAG
+      # RAG_COMPLETE_TAG: "paperless-gpt-rag-complete" # Optional
+      # RAG_DOC_QUERY_PAGE_SIZE: "100" # Optional, default: 100
+      # RAG_RECONCILIATION_INTERVAL: "60" # Optional, minutes, default: 60
     volumes:
       - ./prompts:/app/prompts # Mount the prompts directory
       # For Google Document AI:
@@ -531,6 +550,48 @@ For best results with the enhanced OCR features:
 
 5. **Tagging Strategy**: Use the OCR complete tag (`PDF_OCR_COMPLETE_TAG`) to track which documents have already been processed.
 
+## RAG Integration (Experimental)
+
+paperless-gpt can export your documents to a vector database for use in Retrieval-Augmented Generation (RAG) workflows. When configured, documents tagged with the RAG auto tag are embedded and pushed to your vector store. A background reconciliation job periodically compares the vector store against paperless-ngx and removes stale entries.
+
+### Supported Providers
+
+| Provider | Description |
+|----------|-------------|
+| **Qdrant** | High-performance vector search engine. Set `RAG_PROVIDER=qdrant`. |
+| **ChromaDB** | Open-source embedding database. Set `RAG_PROVIDER=chromadb`. |
+
+### RAG Configuration
+
+To enable RAG, set the following environment variables:
+
+```yaml
+environment:
+  RAG_PROVIDER: "qdrant"                     # or "chromadb"
+  RAG_PROVIDER_URL: "http://qdrant:6334"      # URL of your vector database
+  RAG_API_KEY: "your_api_key"                 # API key (if required by provider)
+  RAG_COLLECTION: "paperless-documents"       # Collection/index name
+  RAG_EMBEDDING_PROVIDER: "openai"            # or "ollama"
+  RAG_EMBEDDING_MODEL: "text-embedding-3-small" # Embedding model to use
+  AUTO_RAG_TAG: "paperless-gpt-auto"          # Optional, defaults to AUTO_TAG value
+  RAG_COMPLETE_TAG: "paperless-gpt-rag-complete" # Optional, tag added after processing
+```
+
+Embedding providers use the same credentials as the main LLM configuration (e.g., `OPENAI_API_KEY` for OpenAI embeddings, `OLLAMA_HOST` for Ollama embeddings).
+
+### RAG Reconciliation
+
+When RAG is enabled, a background reconciliation job runs periodically to keep the vector store in sync with paperless-ngx:
+
+- **What it does**: Fetches all document IDs from both paperless-ngx and the vector store, then deletes any vectors whose corresponding documents no longer exist in paperless-ngx.
+- **Interval**: Configurable via `RAG_RECONCILIATION_INTERVAL` (in minutes, default: `60`).
+- **Page size**: The paperless-ngx API is queried in pages; configure the page size with `RAG_DOC_QUERY_PAGE_SIZE` (default: `100`).
+
+> [!NOTE]
+> RAG integration is experimental. The document is pushed with its content, title, tags, correspondent, document type, and created date as metadata.
+
+---
+
 ## Configuration
 
 ### Environment Variables
@@ -607,6 +668,16 @@ For best results with the enhanced OCR features:
 | `IMAGE_MAX_RENDER_DPI`              | Maximum DPI used when rendering document pages to images.                                                                                                                                     | No       | 600                        |
 | `IMAGE_MAX_FILE_BYTES`              | Maximum JPEG file size in bytes for rendered page images. Images exceeding this are compressed or resized.                                                                                     | No       | 10485760                   |
 | `CORRESPONDENT_BLACK_LIST`          | A comma-separated list of names to exclude from the correspondents suggestions. Example: `John Doe, Jane Smith`.                                                                              | No       |                            |
+| `RAG_PROVIDER`                      | RAG vector database provider (`qdrant` or `chromadb`). Set to enable RAG integration.                                                                                                         | No       |                            |
+| `RAG_PROVIDER_URL`                  | URL of the RAG vector database (e.g., `http://qdrant:6334`). Required if `RAG_PROVIDER` is set.                                                                                               | Cond.    |                            |
+| `RAG_API_KEY`                       | API key for the RAG provider. Required if your provider instance requires authentication.                                                                                                     | No       |                            |
+| `RAG_COLLECTION`                    | Name of the collection/index in the vector database. Required if `RAG_PROVIDER` is set.                                                                                                       | Cond.    |                            |
+| `RAG_EMBEDDING_PROVIDER`            | Embedding provider for RAG (`openai` or `ollama`). Required if `RAG_PROVIDER` is set.                                                                                                         | Cond.    |                            |
+| `RAG_EMBEDDING_MODEL`               | Embedding model name (e.g., `text-embedding-3-small` for OpenAI). Required if `RAG_PROVIDER` is set.                                                                                          | Cond.    |                            |
+| `AUTO_RAG_TAG`                      | Tag for automatically processing documents with RAG.                                                                                                                                          | No       | Value of `AUTO_TAG`        |
+| `RAG_COMPLETE_TAG`                  | Tag added to documents after successful RAG processing.                                                                                                                                       | No       |                            |
+| `RAG_DOC_QUERY_PAGE_SIZE`           | Page size for paginated API calls during RAG reconciliation.                                                                                                                                  | No       | 100                        |
+| `RAG_RECONCILIATION_INTERVAL`       | Interval in minutes between RAG reconciliation runs.                                                                                                                                          | No       | 60                         |
 
 ### Custom Prompt Templates
 
@@ -886,6 +957,7 @@ P.O. Box 94515
    - Add `paperless-gpt` tag to documents for manual processing
    - Add `paperless-gpt-auto` for automatic processing
    - Add `paperless-gpt-ocr-auto` for automatic OCR processing
+   - Add the RAG auto tag (default: `paperless-gpt-auto`) to push documents to your vector database
 
 2. **Visit Web UI**
 

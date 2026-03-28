@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"paperless-gpt/ocr"
+	"paperless-gpt/rag"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
+	"github.com/tmc/langchaingo/embeddings"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/anthropic"
 	"github.com/tmc/langchaingo/llms/mistral"
@@ -50,6 +52,9 @@ var (
 	autoTag                       = os.Getenv("AUTO_TAG")
 	manualOcrTag                  = os.Getenv("MANUAL_OCR_TAG") // Not used yet
 	autoOcrTag                    = os.Getenv("AUTO_OCR_TAG")
+	autoRagTag                    = os.Getenv("AUTO_RAG_TAG")
+	ragCompleteTag                = os.Getenv("RAG_COMPLETE_TAG")
+	ragProviderEnv                = os.Getenv("RAG_PROVIDER")
 	ocrProcessMode                = os.Getenv("OCR_PROCESS_MODE")
 	llmProvider                   = os.Getenv("LLM_PROVIDER")
 	llmModel                      = os.Getenv("LLM_MODEL")
@@ -118,23 +123,26 @@ func refreshCustomFieldsCache(client ClientInterface) {
 
 // App struct to hold dependencies
 type App struct {
-	Client             ClientInterface
-	Database           *gorm.DB
-	LLM                llms.Model
-	VisionLLM          llms.Model
-	ocrProvider        ocr.Provider      // OCR provider interface
-	ocrProcessMode     string            // OCR processing mode: "image" (default), "pdf" or "whole_pdf"
-	docProcessor       DocumentProcessor // Optional: Can be used for mocking
-	localHOCRPath      string            // Path for saving hOCR files locally
-	localPDFPath       string            // Path for saving PDF files locally
-	createLocalHOCR    bool              // Whether to save hOCR files locally
-	createLocalPDF     bool              // Whether to create PDF files locally
-	pdfUpload          bool              // Whether to upload processed PDFs to paperless-ngx
-	pdfReplace         bool              // Whether to replace original document after upload
-	pdfCopyMetadata    bool              // Whether to copy metadata from original to uploaded PDF
-	pdfOCRCompleteTag  string            // Tag to add to documents that have been OCR processed
-	pdfOCRTagging      bool              // Whether to add the OCR complete tag to processed PDFs
-	pdfSkipExistingOCR bool              // Whether to skip processing PDFs that already have OCR detected
+	Client                    ClientInterface
+	Database                  *gorm.DB
+	LLM                       llms.Model
+	VisionLLM                 llms.Model
+	ocrProvider               ocr.Provider      // OCR provider interface
+	ocrProcessMode            string            // OCR processing mode: "image" (default), "pdf" or "whole_pdf"
+	docProcessor              DocumentProcessor // Optional: Can be used for mocking
+	localHOCRPath             string            // Path for saving hOCR files locally
+	localPDFPath              string            // Path for saving PDF files locally
+	createLocalHOCR           bool              // Whether to save hOCR files locally
+	createLocalPDF            bool              // Whether to create PDF files locally
+	pdfUpload                 bool              // Whether to upload processed PDFs to paperless-ngx
+	pdfReplace                bool              // Whether to replace original document after upload
+	pdfCopyMetadata           bool              // Whether to copy metadata from original to uploaded PDF
+	pdfOCRCompleteTag         string            // Tag to add to documents that have been OCR processed
+	pdfOCRTagging             bool              // Whether to add the OCR complete tag to processed PDFs
+	pdfSkipExistingOCR        bool              // Whether to skip processing PDFs that already have OCR detected
+	ragProvider               rag.RagProvider   // RAG provider for exporting processed documents
+	ragPageSize               int               // Page size for paginated API calls during RAG reconciliation
+	ragReconciliationInterval time.Duration     // Interval between RAG reconciliation runs
 }
 
 func main() {
@@ -315,25 +323,71 @@ func main() {
 		log.Infof("✅ OCR provider and processing mode configuration is valid")
 	}
 
+	// Initialize RAG provider
+	var ragProvider rag.RagProvider
+	if ragProviderEnv != "" {
+		embedder, err := createEmbedder()
+		if err != nil {
+			log.Fatalf("Failed to initialize embedder for RAG: %v", err)
+		}
+		if embedder != nil {
+			log.Infof("✅ RAG embedder initialized successfully")
+		}
+
+		cfg := map[string]string{
+			"RAG_PROVIDER_URL": os.Getenv("RAG_PROVIDER_URL"),
+			"RAG_API_KEY":      os.Getenv("RAG_API_KEY"),
+			"RAG_COLLECTION":   os.Getenv("RAG_COLLECTION"),
+		}
+		ragProvider, err = rag.NewProvider(ragProviderEnv, cfg, embedder)
+		if err != nil {
+			log.Fatalf("Failed to initialize RAG provider: %v", err)
+		}
+		log.Infof("✅ RAG provider '%s' initialized successfully", ragProviderEnv)
+	}
+
+	// Parse RAG page size (default 100)
+	ragPageSize := 100
+	if v := os.Getenv("RAG_DOC_QUERY_PAGE_SIZE"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			ragPageSize = parsed
+		} else {
+			log.Warnf("Invalid RAG_DOC_QUERY_PAGE_SIZE value '%s', using default %d", v, ragPageSize)
+		}
+	}
+
+	// Parse RAG reconciliation interval (default 60 minutes)
+	ragReconciliationInterval := 60 * time.Minute
+	if v := os.Getenv("RAG_RECONCILIATION_INTERVAL"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			ragReconciliationInterval = time.Duration(parsed) * time.Minute
+		} else {
+			log.Warnf("Invalid RAG_RECONCILIATION_INTERVAL value '%s', using default %v", v, ragReconciliationInterval)
+		}
+	}
+
 	// Initialize App with dependencies
 	app := &App{
-		Client:             client,
-		Database:           database,
-		LLM:                llm,
-		VisionLLM:          visionLlm,
-		ocrProvider:        ocrProvider,
-		ocrProcessMode:     ocrProcessMode,
-		docProcessor:       nil, // App itself implements DocumentProcessor
-		localHOCRPath:      localHOCRPath,
-		localPDFPath:       localPDFPath,
-		createLocalHOCR:    createLocalHOCR,
-		createLocalPDF:     createLocalPDF,
-		pdfUpload:          pdfUpload,
-		pdfReplace:         pdfReplace,
-		pdfCopyMetadata:    pdfCopyMetadata,
-		pdfOCRCompleteTag:  pdfOCRCompleteTag,
-		pdfOCRTagging:      pdfOCRTagging,
-		pdfSkipExistingOCR: pdfSkipExistingOCR,
+		Client:                    client,
+		Database:                  database,
+		LLM:                       llm,
+		VisionLLM:                 visionLlm,
+		ocrProvider:               ocrProvider,
+		ocrProcessMode:            ocrProcessMode,
+		docProcessor:              nil, // App itself implements DocumentProcessor
+		localHOCRPath:             localHOCRPath,
+		localPDFPath:              localPDFPath,
+		createLocalHOCR:           createLocalHOCR,
+		createLocalPDF:            createLocalPDF,
+		pdfUpload:                 pdfUpload,
+		pdfReplace:                pdfReplace,
+		pdfCopyMetadata:           pdfCopyMetadata,
+		pdfOCRCompleteTag:         pdfOCRCompleteTag,
+		pdfOCRTagging:             pdfOCRTagging,
+		pdfSkipExistingOCR:        pdfSkipExistingOCR,
+		ragProvider:               ragProvider,
+		ragPageSize:               ragPageSize,
+		ragReconciliationInterval: ragReconciliationInterval,
 	}
 
 	if app.isOcrEnabled() {
@@ -527,6 +581,10 @@ func (app *App) isOcrEnabled() bool {
 	return app.ocrProvider != nil
 }
 
+func (app *App) isRagEnabled() bool {
+	return app.ragProvider != nil
+}
+
 // validateOCRProviderModeCompatibility validates that the OCR provider supports the specified processing mode
 func validateOCRProviderModeCompatibility(provider, mode, visionProvider string) error {
 	// Define which providers support which modes
@@ -582,6 +640,15 @@ func validateOrDefaultEnvVars() {
 
 	if pdfOCRCompleteTag == "" {
 		pdfOCRCompleteTag = "paperless-gpt-ocr-complete"
+	}
+
+	if autoRagTag == "" {
+		autoRagTag = autoTag // Defaults to paperless-gpt-auto if omitted
+	}
+	fmt.Printf("Using %s as auto RAG tag\n", autoRagTag)
+
+	if ragCompleteTag != "" {
+		fmt.Printf("Using %s as complete RAG tag\n", ragCompleteTag)
 	}
 
 	if paperlessBaseURL == "" {
@@ -1163,4 +1230,45 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Add(key, value)
 	}
 	return t.transport.RoundTrip(req)
+}
+
+// createEmbedder initializes the document embedding client if configured
+func createEmbedder() (rag.RagEmbedder, error) {
+	provider := os.Getenv("RAG_EMBEDDING_PROVIDER")
+	model := os.Getenv("RAG_EMBEDDING_MODEL")
+	if provider == "" {
+		return nil, nil // No embedding provider configured
+	}
+
+	switch strings.ToLower(provider) {
+	case "openai":
+		opts := []openai.Option{openai.WithEmbeddingModel(model)}
+		if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
+			opts = append(opts, openai.WithToken(apiKey))
+		}
+		if baseURL := os.Getenv("OPENAI_BASE_URL"); baseURL != "" {
+			opts = append(opts, openai.WithBaseURL(baseURL))
+		}
+		llm, err := openai.New(opts...)
+		if err != nil {
+			return nil, err
+		}
+		return embeddings.NewEmbedder(llm)
+	case "ollama":
+		host := os.Getenv("OLLAMA_HOST")
+		if host == "" {
+			host = "http://127.0.0.1:11434"
+		}
+		opts := []ollama.Option{
+			ollama.WithModel(model),
+			ollama.WithServerURL(host),
+		}
+		llm, err := ollama.New(opts...)
+		if err != nil {
+			return nil, err
+		}
+		return embeddings.NewEmbedder(llm)
+	default:
+		return nil, fmt.Errorf("unsupported RAG embedding provider: %s", provider)
+	}
 }
