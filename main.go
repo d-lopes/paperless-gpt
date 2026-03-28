@@ -123,24 +123,26 @@ func refreshCustomFieldsCache(client ClientInterface) {
 
 // App struct to hold dependencies
 type App struct {
-	Client             ClientInterface
-	Database           *gorm.DB
-	LLM                llms.Model
-	VisionLLM          llms.Model
-	ocrProvider        ocr.Provider      // OCR provider interface
-	ocrProcessMode     string            // OCR processing mode: "image" (default), "pdf" or "whole_pdf"
-	docProcessor       DocumentProcessor // Optional: Can be used for mocking
-	localHOCRPath      string            // Path for saving hOCR files locally
-	localPDFPath       string            // Path for saving PDF files locally
-	createLocalHOCR    bool              // Whether to save hOCR files locally
-	createLocalPDF     bool              // Whether to create PDF files locally
-	pdfUpload          bool              // Whether to upload processed PDFs to paperless-ngx
-	pdfReplace         bool              // Whether to replace original document after upload
-	pdfCopyMetadata    bool              // Whether to copy metadata from original to uploaded PDF
-	pdfOCRCompleteTag  string            // Tag to add to documents that have been OCR processed
-	pdfOCRTagging      bool              // Whether to add the OCR complete tag to processed PDFs
-	pdfSkipExistingOCR bool              // Whether to skip processing PDFs that already have OCR detected
-	ragProvider        rag.Provider      // RAG provider for exporting processed documents
+	Client                    ClientInterface
+	Database                  *gorm.DB
+	LLM                       llms.Model
+	VisionLLM                 llms.Model
+	ocrProvider               ocr.Provider      // OCR provider interface
+	ocrProcessMode            string            // OCR processing mode: "image" (default), "pdf" or "whole_pdf"
+	docProcessor              DocumentProcessor // Optional: Can be used for mocking
+	localHOCRPath             string            // Path for saving hOCR files locally
+	localPDFPath              string            // Path for saving PDF files locally
+	createLocalHOCR           bool              // Whether to save hOCR files locally
+	createLocalPDF            bool              // Whether to create PDF files locally
+	pdfUpload                 bool              // Whether to upload processed PDFs to paperless-ngx
+	pdfReplace                bool              // Whether to replace original document after upload
+	pdfCopyMetadata           bool              // Whether to copy metadata from original to uploaded PDF
+	pdfOCRCompleteTag         string            // Tag to add to documents that have been OCR processed
+	pdfOCRTagging             bool              // Whether to add the OCR complete tag to processed PDFs
+	pdfSkipExistingOCR        bool              // Whether to skip processing PDFs that already have OCR detected
+	ragProvider               rag.RagProvider   // RAG provider for exporting processed documents
+	ragPageSize               int               // Page size for paginated API calls during RAG reconciliation
+	ragReconciliationInterval time.Duration     // Interval between RAG reconciliation runs
 }
 
 func main() {
@@ -322,7 +324,7 @@ func main() {
 	}
 
 	// Initialize RAG provider
-	var ragProvider rag.Provider
+	var ragProvider rag.RagProvider
 	if ragProviderEnv != "" {
 		embedder, err := createEmbedder()
 		if err != nil {
@@ -333,9 +335,9 @@ func main() {
 		}
 
 		cfg := map[string]string{
-			"QDRANT_URL":        os.Getenv("QDRANT_URL"),
-			"QDRANT_API_KEY":    os.Getenv("QDRANT_API_KEY"),
-			"QDRANT_COLLECTION": os.Getenv("QDRANT_COLLECTION"),
+			"RAG_PROVIDER_URL": os.Getenv("RAG_PROVIDER_URL"),
+			"RAG_API_KEY":      os.Getenv("RAG_API_KEY"),
+			"RAG_COLLECTION":   os.Getenv("RAG_COLLECTION"),
 		}
 		ragProvider, err = rag.NewProvider(ragProviderEnv, cfg, embedder)
 		if err != nil {
@@ -344,26 +346,48 @@ func main() {
 		log.Infof("✅ RAG provider '%s' initialized successfully", ragProviderEnv)
 	}
 
+	// Parse RAG page size (default 100)
+	ragPageSize := 100
+	if v := os.Getenv("RAG_DOC_QUERY_PAGE_SIZE"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			ragPageSize = parsed
+		} else {
+			log.Warnf("Invalid RAG_DOC_QUERY_PAGE_SIZE value '%s', using default %d", v, ragPageSize)
+		}
+	}
+
+	// Parse RAG reconciliation interval (default 60 minutes)
+	ragReconciliationInterval := 60 * time.Minute
+	if v := os.Getenv("RAG_RECONCILIATION_INTERVAL"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			ragReconciliationInterval = time.Duration(parsed) * time.Minute
+		} else {
+			log.Warnf("Invalid RAG_RECONCILIATION_INTERVAL value '%s', using default %v", v, ragReconciliationInterval)
+		}
+	}
+
 	// Initialize App with dependencies
 	app := &App{
-		Client:             client,
-		Database:           database,
-		LLM:                llm,
-		VisionLLM:          visionLlm,
-		ocrProvider:        ocrProvider,
-		ocrProcessMode:     ocrProcessMode,
-		docProcessor:       nil, // App itself implements DocumentProcessor
-		localHOCRPath:      localHOCRPath,
-		localPDFPath:       localPDFPath,
-		createLocalHOCR:    createLocalHOCR,
-		createLocalPDF:     createLocalPDF,
-		pdfUpload:          pdfUpload,
-		pdfReplace:         pdfReplace,
-		pdfCopyMetadata:    pdfCopyMetadata,
-		pdfOCRCompleteTag:  pdfOCRCompleteTag,
-		pdfOCRTagging:      pdfOCRTagging,
-		pdfSkipExistingOCR: pdfSkipExistingOCR,
-		ragProvider:        ragProvider,
+		Client:                    client,
+		Database:                  database,
+		LLM:                       llm,
+		VisionLLM:                 visionLlm,
+		ocrProvider:               ocrProvider,
+		ocrProcessMode:            ocrProcessMode,
+		docProcessor:              nil, // App itself implements DocumentProcessor
+		localHOCRPath:             localHOCRPath,
+		localPDFPath:              localPDFPath,
+		createLocalHOCR:           createLocalHOCR,
+		createLocalPDF:            createLocalPDF,
+		pdfUpload:                 pdfUpload,
+		pdfReplace:                pdfReplace,
+		pdfCopyMetadata:           pdfCopyMetadata,
+		pdfOCRCompleteTag:         pdfOCRCompleteTag,
+		pdfOCRTagging:             pdfOCRTagging,
+		pdfSkipExistingOCR:        pdfSkipExistingOCR,
+		ragProvider:               ragProvider,
+		ragPageSize:               ragPageSize,
+		ragReconciliationInterval: ragReconciliationInterval,
 	}
 
 	if app.isOcrEnabled() {
@@ -622,7 +646,7 @@ func validateOrDefaultEnvVars() {
 		autoRagTag = autoTag // Defaults to paperless-gpt-auto if omitted
 	}
 	fmt.Printf("Using %s as auto RAG tag\n", autoRagTag)
-	
+
 	if ragCompleteTag != "" {
 		fmt.Printf("Using %s as complete RAG tag\n", ragCompleteTag)
 	}
@@ -1209,7 +1233,7 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // createEmbedder initializes the document embedding client if configured
-func createEmbedder() (rag.Embedder, error) {
+func createEmbedder() (rag.RagEmbedder, error) {
 	provider := os.Getenv("RAG_EMBEDDING_PROVIDER")
 	model := os.Getenv("RAG_EMBEDDING_MODEL")
 	if provider == "" {

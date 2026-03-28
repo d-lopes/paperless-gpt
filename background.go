@@ -15,8 +15,10 @@ type BackgroundProcessor interface {
 	processAutoOcrTagDocuments(ctx context.Context) (int, error)
 	processAutoTagDocuments(ctx context.Context) (int, error)
 	processAutoRagDocuments(ctx context.Context) (int, error)
+	processRagReconciliation(ctx context.Context) (int, error)
 	isOcrEnabled() bool
 	isRagEnabled() bool
+	getReconciliationInterval() time.Duration
 }
 
 // Start our background tasks in a goroutine
@@ -27,6 +29,7 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 		pollingInterval := 10 * time.Second
 
 		backoffDuration := minBackoffDuration
+		lastReconciliation := time.Time{} // zero value ensures first run triggers immediately
 
 		for {
 			select {
@@ -62,6 +65,18 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 						return 0, fmt.Errorf("error in processAutoRagDocuments: %w", err)
 					}
 					count += ragCount
+
+					// Run reconciliation based on configured interval
+					if time.Since(lastReconciliation) >= app.getReconciliationInterval() {
+						reconCount, err := app.processRagReconciliation(ctx)
+						if err != nil {
+							log.Errorf("error in processRagReconciliation: %v", err)
+							// Do not fail the whole iteration if reconciliation fails
+						} else {
+							count += reconCount
+						}
+						lastReconciliation = time.Now()
+					}
 				}
 
 				return count, nil
@@ -88,6 +103,13 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 			}
 		}
 	}()
+}
+
+func (app *App) getReconciliationInterval() time.Duration {
+	if app.ragReconciliationInterval > 0 {
+		return app.ragReconciliationInterval
+	}
+	return 60 * time.Minute // default 1 hour
 }
 
 // processAutoTagDocuments handles the background auto-tagging of documents
@@ -380,4 +402,56 @@ func (app *App) processAutoRagDocuments(ctx context.Context) (int, error) {
 	}
 
 	return successCount, nil
+}
+
+func (app *App) processRagReconciliation(ctx context.Context) (int, error) {
+	if app.ragProvider == nil {
+		return 0, nil
+	}
+
+	log.Infof("Starting RAG reconciliation")
+
+	// 1. Get all doc IDs from RAG
+	ragDocIDs, err := app.ragProvider.GetAllDocumentIDs(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("error fetching RAG document IDs: %w", err)
+	}
+
+	if len(ragDocIDs) == 0 {
+		return 0, nil
+	}
+
+	// 2. Get all active doc IDs from paperless-ngx
+	paperlessDocIDs, err := app.Client.GetAllDocumentIDs(ctx, app.ragPageSize, nil)
+	if err != nil {
+		return 0, fmt.Errorf("error fetching active paperless document IDs: %w", err)
+	}
+
+	// 3. Create map for quick lookup
+	activeDocsMap := make(map[int]struct{}, len(paperlessDocIDs))
+	for _, id := range paperlessDocIDs {
+		activeDocsMap[id] = struct{}{}
+	}
+
+	// 4. Compare and delete orphaned chunks
+	deletedCount := 0
+	for _, ragDocID := range ragDocIDs {
+		if _, exists := activeDocsMap[ragDocID]; !exists {
+			log.Infof("Deleting orphaned RAG chunks for document ID: %d", ragDocID)
+			err := app.ragProvider.DeleteDocument(ctx, ragDocID)
+			if err != nil {
+				log.Errorf("Failed to delete orphaned chunks for document ID %d: %v", ragDocID, err)
+			} else {
+				deletedCount++
+			}
+		}
+	}
+
+	if deletedCount > 0 {
+		log.Infof("RAG reconciliation completed: deleted chunks for %d orphaned documents", deletedCount)
+	} else {
+		log.Debugf("RAG reconciliation completed: no orphaned documents found")
+	}
+
+	return deletedCount, nil
 }

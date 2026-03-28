@@ -1430,3 +1430,69 @@ func (client *PaperlessClient) UploadDocument(ctx context.Context, pdfData []byt
 	log.Infof("Successfully uploaded document, received task ID: %s", taskID)
 	return taskID, nil
 }
+
+// GetAllDocumentIDs retrieves the IDs of all documents from the Paperless-NGX API
+func (client *PaperlessClient) GetAllDocumentIDs(ctx context.Context, pageSize int, queryParams map[string]string) ([]int, error) {
+	var allDocumentIDs []int
+
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+
+	params := url.Values{}
+	params.Set("page_size", strconv.Itoa(pageSize))
+	for k, v := range queryParams {
+		params.Set(k, v)
+	}
+
+	path := "api/documents/?" + params.Encode()
+
+	for path != "" {
+		resp, err := client.Do(ctx, "GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("error fetching document IDs: %d, %s", resp.StatusCode, string(bodyBytes))
+		}
+
+		var response struct {
+			Results []struct {
+				ID int `json:"id"`
+			} `json:"results"`
+			Next string `json:"next"`
+		}
+
+		err = json.NewDecoder(resp.Body).Decode(&response)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, doc := range response.Results {
+			allDocumentIDs = append(allDocumentIDs, doc.ID)
+		}
+
+		if response.Next != "" {
+			nextURL := response.Next
+			if strings.HasPrefix(nextURL, "http") {
+				if parsedURL, err := url.Parse(nextURL); err == nil {
+					path = strings.TrimPrefix(parsedURL.Path, "/")
+					if parsedURL.RawQuery != "" {
+						path += "?" + parsedURL.RawQuery
+					}
+				} else {
+					return nil, fmt.Errorf("failed to parse next URL: %v", err)
+				}
+			} else {
+				path = strings.TrimPrefix(nextURL, "/")
+			}
+		} else {
+			path = ""
+		}
+	}
+
+	return allDocumentIDs, nil
+}

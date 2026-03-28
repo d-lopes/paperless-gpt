@@ -410,6 +410,10 @@ func (m *mockPaperlessClient) GetTaskStatus(ctx context.Context, taskID string) 
 }
 func (m *mockPaperlessClient) DeleteDocument(ctx context.Context, documentID int) error { return nil }
 
+func (m *mockPaperlessClient) GetAllDocumentIDs(ctx context.Context, pageSize int, queryParams map[string]string) ([]int, error) {
+	return []int{}, nil
+}
+
 func TestGetSuggestedCustomFields(t *testing.T) {
 	// 1. Setup
 	mockedLLMResponse := `

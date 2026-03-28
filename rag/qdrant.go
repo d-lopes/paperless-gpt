@@ -20,17 +20,17 @@ type QdrantProvider struct {
 	APIKey     string
 	Collection string
 	Client     *http.Client
-	Embedder   Embedder
+	Embedder   RagEmbedder
 }
 
-func NewQdrantProvider(cfg map[string]string, embedder Embedder) (*QdrantProvider, error) {
-	url := cfg["QDRANT_URL"]
-	apiKey := cfg["QDRANT_API_KEY"]
-	collection := cfg["QDRANT_COLLECTION"]
+func NewQdrantProvider(cfg map[string]string, embedder RagEmbedder) (*QdrantProvider, error) {
+	url := cfg["RAG_PROVIDER_URL"]
+	apiKey := cfg["RAG_API_KEY"]
+	collection := cfg["RAG_COLLECTION"]
 	if url == "" || collection == "" {
-		return nil, fmt.Errorf("QDRANT_URL and QDRANT_COLLECTION are required for Qdrant RAG integration")
+		return nil, fmt.Errorf("RAG_PROVIDER_URL and RAG_COLLECTION are required for Qdrant RAG integration")
 	}
-	
+
 	p := &QdrantProvider{
 		URL:        strings.TrimRight(url, "/"),
 		APIKey:     apiKey,
@@ -101,6 +101,11 @@ func (p *QdrantProvider) ensureCollectionExists(ctx context.Context) error {
 }
 
 func (p *QdrantProvider) PushDocument(ctx context.Context, doc Document) error {
+	// First delete any existing points to prevent duplication
+	if err := p.DeleteDocument(ctx, doc.ID); err != nil {
+		fmt.Printf("Warning: failed to delete existing document chunks for ID %d: %v\n", doc.ID, err)
+	}
+
 	url := fmt.Sprintf("%s/collections/%s/points?wait=true", p.URL, p.Collection)
 
 	var chunkSize int
@@ -190,4 +195,121 @@ func (p *QdrantProvider) PushDocument(ctx context.Context, doc Document) error {
 	}
 
 	return nil
+}
+
+func (p *QdrantProvider) DeleteDocument(ctx context.Context, documentID int) error {
+	url := fmt.Sprintf("%s/collections/%s/points/delete?wait=true", p.URL, p.Collection)
+
+	payload := map[string]interface{}{
+		"filter": map[string]interface{}{
+			"must": []map[string]interface{}{
+				{
+					"key": "document_id",
+					"match": map[string]interface{}{
+						"value": documentID,
+					},
+				},
+			},
+		},
+	}
+
+	jsonStr, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal qdrant delete payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonStr))
+	if err != nil {
+		return fmt.Errorf("failed to create qdrant delete request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.APIKey != "" {
+		req.Header.Set("api-key", p.APIKey)
+	}
+
+	resp, err := p.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute qdrant delete request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("qdrant delete returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	return nil
+}
+
+func (p *QdrantProvider) GetAllDocumentIDs(ctx context.Context) ([]int, error) {
+	url := fmt.Sprintf("%s/collections/%s/points/scroll", p.URL, p.Collection)
+
+	uniqueIDs := make(map[int]struct{})
+	var nextOffset interface{} = nil
+	limit := 1000
+
+	for {
+		payload := map[string]interface{}{
+			"limit":        limit,
+			"with_payload": []string{"document_id"},
+			"with_vector":  false,
+		}
+		if nextOffset != nil {
+			payload["offset"] = nextOffset
+		}
+
+		jsonStr, _ := json.Marshal(payload)
+
+		req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonStr))
+		req.Header.Set("Content-Type", "application/json")
+		if p.APIKey != "" {
+			req.Header.Set("api-key", p.APIKey)
+		}
+
+		resp, err := p.Client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scroll qdrant: %w", err)
+		}
+
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("qdrant scroll failed: status %d %s", resp.StatusCode, string(bodyBytes))
+		}
+
+		var result struct {
+			Result struct {
+				Points []struct {
+					Payload struct {
+						DocumentID float64 `json:"document_id"`
+					} `json:"payload"`
+				} `json:"points"`
+				NextPageOffset interface{} `json:"next_page_offset"`
+			} `json:"result"`
+		}
+
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
+			return nil, fmt.Errorf("failed to parse qdrant scroll response: %w", err)
+		}
+
+		for _, pt := range result.Result.Points {
+			id := int(pt.Payload.DocumentID)
+			if id > 0 {
+				uniqueIDs[id] = struct{}{}
+			}
+		}
+
+		if result.Result.NextPageOffset == nil {
+			break
+		}
+		nextOffset = result.Result.NextPageOffset
+	}
+
+	var ids []int
+	for id := range uniqueIDs {
+		ids = append(ids, id)
+	}
+
+	return ids, nil
 }

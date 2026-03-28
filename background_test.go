@@ -70,6 +70,14 @@ func (m *mockClient) GetDocumentsByTag(ctx context.Context, tag string, pageSize
 	return m.taggedDocuments[tag], nil
 }
 
+func (m *mockClient) GetAllDocumentIDs(ctx context.Context, pageSize int, queryParams map[string]string) ([]int, error) {
+	var ids []int
+	for id := range m.documents {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 func (m *mockClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
 	m.updateDocsCalled = true
 	return nil
@@ -139,6 +147,17 @@ func (a *appStubBG) processAutoRagDocuments(ctx context.Context) (int, error) {
 		return 1, nil
 	}
 	return a.App.processAutoRagDocuments(ctx)
+}
+
+func (a *appStubBG) processRagReconciliation(ctx context.Context) (int, error) {
+	if a.App == nil {
+		return 0, nil
+	}
+	return a.App.processRagReconciliation(ctx)
+}
+
+func (a *appStubBG) getReconciliationInterval() time.Duration {
+	return 1 * time.Millisecond // very short for tests
 }
 
 // Setup a Test
@@ -560,6 +579,14 @@ type mockRagProvider struct {
 func (m *mockRagProvider) PushDocument(ctx context.Context, doc rag.Document) error {
 	m.calls++
 	return nil
+}
+
+func (m *mockRagProvider) DeleteDocument(ctx context.Context, documentID int) error {
+	return nil
+}
+
+func (m *mockRagProvider) GetAllDocumentIDs(ctx context.Context) ([]int, error) {
+	return []int{}, nil
 }
 
 func TestProcessAutoRagDocuments(t *testing.T) {
