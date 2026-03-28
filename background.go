@@ -374,21 +374,26 @@ func (app *App) processAutoRagDocuments(ctx context.Context) (int, error) {
 			continue
 		}
 
+		addTags := []string{}
+		if ragCompleteTag != "" {
+			addTags = []string{ragCompleteTag}
+			docLogger.Infof("Adding tags %v to document %d", addTags, document.ID)
+		} else {
+			docLogger.Infof("No RAG_COMPLETE_TAG configured, not adding marked for RAG processing as tag to document %d", document.ID)
+		}
+
 		// Update tags on success
 		documentSuggestion := DocumentSuggestion{
 			ID:               document.ID,
 			OriginalDocument: document,
 			RemoveTags:       []string{autoRagTag},
-		}
-
-		if ragCompleteTag != "" {
-			documentSuggestion.AddTags = []string{ragCompleteTag}
-			documentSuggestion.KeepOriginalTags = true
+			SuggestedTags:    addTags, // using suggested tags here be caue AddTags is not implemented
+			KeepOriginalTags: true,
 		}
 
 		err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{documentSuggestion}, app.Database, false)
 		if err != nil {
-			docLogger.Errorf("Failed to update tags after RAG push: %v", err)
+			docLogger.Errorf("Failed to remove tag %s from document %d: %v", autoRagTag, document.ID, err)
 			errs = append(errs, fmt.Errorf("document %d update error: %w", document.ID, err))
 			continue
 		}
@@ -418,19 +423,22 @@ func (app *App) processRagReconciliation(ctx context.Context) (int, error) {
 	}
 
 	if len(ragDocIDs) == 0 {
+		log.Infof("RAG reconciliation completed: No documents found in RAG")
 		return 0, nil
 	}
 
-	// 2. Get all active doc IDs from paperless-ngx
-	paperlessDocIDs, err := app.Client.GetAllDocumentIDs(ctx, app.ragPageSize, nil)
+	// 2. Get all doc IDs from paperless-ngx which have been processed by RAG
+	paperlessDocIDs, err := app.Client.GetDocumentsByTag(ctx, ragCompleteTag, app.ragPageSize)
 	if err != nil {
 		return 0, fmt.Errorf("error fetching active paperless document IDs: %w", err)
+	} else {
+		log.Infof("RAG reconciliation: %d documents in paperless-ngx, %d in vector store", len(paperlessDocIDs), len(ragDocIDs))
 	}
 
 	// 3. Create map for quick lookup
 	activeDocsMap := make(map[int]struct{}, len(paperlessDocIDs))
-	for _, id := range paperlessDocIDs {
-		activeDocsMap[id] = struct{}{}
+	for _, doc := range paperlessDocIDs {
+		activeDocsMap[doc.ID] = struct{}{}
 	}
 
 	// 4. Compare and delete orphaned chunks
@@ -448,9 +456,9 @@ func (app *App) processRagReconciliation(ctx context.Context) (int, error) {
 	}
 
 	if deletedCount > 0 {
-		log.Infof("RAG reconciliation completed: deleted chunks for %d orphaned documents", deletedCount)
+		log.Infof("RAG reconciliation completed: deleted chunks for %d orphaned document(s)", deletedCount)
 	} else {
-		log.Debugf("RAG reconciliation completed: no orphaned documents found")
+		log.Infof("RAG reconciliation completed: no orphaned documents found")
 	}
 
 	return deletedCount, nil

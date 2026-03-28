@@ -172,7 +172,6 @@ type ClientInterface interface {
 	UploadDocument(ctx context.Context, data []byte, filename string, metadata map[string]interface{}) (string, error)
 	GetTaskStatus(ctx context.Context, taskID string) (map[string]interface{}, error)
 	DeleteDocument(ctx context.Context, documentID int) error
-	GetAllDocumentIDs(ctx context.Context, pageSize int, queryParams map[string]string) ([]int, error)
 }
 
 // DocumentProcessor defines the interface for processing documents with OCR

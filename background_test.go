@@ -70,14 +70,6 @@ func (m *mockClient) GetDocumentsByTag(ctx context.Context, tag string, pageSize
 	return m.taggedDocuments[tag], nil
 }
 
-func (m *mockClient) GetAllDocumentIDs(ctx context.Context, pageSize int, queryParams map[string]string) ([]int, error) {
-	var ids []int
-	for id := range m.documents {
-		ids = append(ids, id)
-	}
-	return ids, nil
-}
-
 func (m *mockClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
 	m.updateDocsCalled = true
 	return nil
@@ -583,10 +575,6 @@ func (m *mockRagProvider) PushDocument(ctx context.Context, doc rag.Document) er
 
 func (m *mockRagProvider) DeleteDocument(ctx context.Context, documentID int) error {
 	return nil
-}
-
-func (m *mockRagProvider) GetAllDocumentIDs(ctx context.Context) ([]int, error) {
-	return []int{}, nil
 }
 
 func TestProcessAutoRagDocuments(t *testing.T) {
