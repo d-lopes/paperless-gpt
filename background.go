@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"paperless-gpt/rag"
 	"slices"
 	"strings"
 	"time"
@@ -13,7 +14,9 @@ import (
 type BackgroundProcessor interface {
 	processAutoOcrTagDocuments(ctx context.Context) (int, error)
 	processAutoTagDocuments(ctx context.Context) (int, error)
+	processAutoRagDocuments(ctx context.Context) (int, error)
 	isOcrEnabled() bool
+	isRagEnabled() bool
 }
 
 // Start our background tasks in a goroutine
@@ -51,6 +54,15 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 					return 0, fmt.Errorf("error in processAutoTagDocuments: %w", err)
 				}
 				count += autoCount
+
+				// Run RAG sync
+				if app.isRagEnabled() {
+					ragCount, err := app.processAutoRagDocuments(ctx)
+					if err != nil {
+						return 0, fmt.Errorf("error in processAutoRagDocuments: %w", err)
+					}
+					count += ragCount
+				}
 
 				return count, nil
 			}()
@@ -277,6 +289,89 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 		}
 
 		docLogger.Info("Successfully processed document OCR")
+		successCount++
+	}
+
+	if len(errs) > 0 {
+		return successCount, fmt.Errorf("one or more errors occurred: %w", errors.Join(errs...))
+	}
+
+	return successCount, nil
+}
+
+// processAutoRagDocuments handles pushing documents to a connected RAG provider
+func (app *App) processAutoRagDocuments(ctx context.Context) (int, error) {
+	documents, err := app.Client.GetDocumentsByTag(ctx, autoRagTag, 25)
+	if err != nil {
+		return 0, fmt.Errorf("error fetching documents with autoRagTag: %w", err)
+	}
+
+	if len(documents) == 0 {
+		log.Debugf("No documents with tag %s found for RAG sync", autoRagTag)
+		return 0, nil
+	}
+
+	log.Debugf("Found %d documents with tag %s for RAG sync", len(documents), autoRagTag)
+
+	successCount := 0
+	var errs []error
+
+	for _, docSummary := range documents {
+		document, err := app.Client.GetDocument(ctx, docSummary.ID)
+		if err != nil {
+			err = fmt.Errorf("error fetching full details for document %d: %w", docSummary.ID, err)
+			documentLogger(docSummary.ID).Error(err.Error())
+			errs = append(errs, err)
+			continue
+		}
+
+		docLogger := documentLogger(document.ID)
+		docLogger.Info("Processing document for RAG Export")
+
+		var filteredTags []string
+		for _, t := range document.Tags {
+			if t != autoRagTag {
+				filteredTags = append(filteredTags, t)
+			}
+		}
+
+		ragDoc := rag.Document{
+			ID:            document.ID,
+			Title:         document.Title,
+			Content:       document.Content,
+			Tags:          filteredTags,
+			DocumentType:  document.DocumentTypeName,
+			Correspondent: document.Correspondent,
+			CreatedDate:   document.CreatedDate,
+		}
+
+		err = app.ragProvider.PushDocument(ctx, ragDoc)
+		if err != nil {
+			docLogger.Errorf("Failed to push document to RAG provider: %v", err)
+			errs = append(errs, fmt.Errorf("document %d RAG error: %w", document.ID, err))
+			continue
+		}
+
+		// Update tags on success
+		documentSuggestion := DocumentSuggestion{
+			ID:               document.ID,
+			OriginalDocument: document,
+			RemoveTags:       []string{autoRagTag},
+		}
+
+		if ragCompleteTag != "" {
+			documentSuggestion.AddTags = []string{ragCompleteTag}
+			documentSuggestion.KeepOriginalTags = true
+		}
+
+		err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{documentSuggestion}, app.Database, false)
+		if err != nil {
+			docLogger.Errorf("Failed to update tags after RAG push: %v", err)
+			errs = append(errs, fmt.Errorf("document %d update error: %w", document.ID, err))
+			continue
+		}
+
+		docLogger.Info("Successfully pushed document to RAG Server")
 		successCount++
 	}
 

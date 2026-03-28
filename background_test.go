@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"paperless-gpt/ocr"
+	"paperless-gpt/rag"
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/stretchr/testify/assert"
@@ -128,6 +129,16 @@ func (a *appStubBG) processAutoTagDocuments(ctx context.Context) (int, error) {
 		return 1, nil
 	}
 	return a.App.processAutoTagDocuments(ctx)
+}
+
+func (a *appStubBG) isRagEnabled() bool { return true }
+
+func (a *appStubBG) processAutoRagDocuments(ctx context.Context) (int, error) {
+	// Return fixed count for background test
+	if a.App == nil {
+		return 1, nil
+	}
+	return a.App.processAutoRagDocuments(ctx)
 }
 
 // Setup a Test
@@ -540,4 +551,51 @@ func TestProcessAutoOcrTagDocuments(t *testing.T) {
 			assert.True(t, client.updateDocsCalled, "UpdateDocuments should have been called")
 		})
 	}
+}
+
+type mockRagProvider struct {
+	calls int
+}
+
+func (m *mockRagProvider) PushDocument(ctx context.Context, doc rag.Document) error {
+	m.calls++
+	return nil
+}
+
+func TestProcessAutoRagDocuments(t *testing.T) {
+	autoRagTag = "paperless-gpt-rag-auto"
+	ragCompleteTag = "paperless-gpt-rag-complete"
+
+	env := setupTest(t)
+	defer env.teardown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	client := newMockClient(env.client)
+	client.AddTag(autoRagTag, 1)
+	client.AddTag(ragCompleteTag, 2)
+
+	doc := Document{
+		ID:               1,
+		Title:            "Doc for RAG",
+		Tags:             []string{autoRagTag},
+		Content:          "RAG content",
+		OriginalFileName: "rag.pdf",
+	}
+	client.AddDocument(doc, []string{autoRagTag})
+
+	mockProvider := &mockRagProvider{}
+
+	app := &App{
+		Client:      client,
+		Database:    env.db,
+		ragProvider: mockProvider,
+	}
+
+	count, err := app.processAutoRagDocuments(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	assert.True(t, client.updateDocsCalled)
+	assert.Equal(t, 1, mockProvider.calls)
 }
