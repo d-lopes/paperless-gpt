@@ -577,6 +577,10 @@ func (m *mockRagProvider) DeleteDocument(ctx context.Context, documentID int) er
 	return nil
 }
 
+func (m *mockRagProvider) GetAllDocumentIDs(ctx context.Context) ([]int, error) {
+	return nil, nil
+}
+
 func TestProcessAutoRagDocuments(t *testing.T) {
 	autoRagTag = "paperless-gpt-rag-auto"
 	ragCompleteTag = "paperless-gpt-rag-complete"
